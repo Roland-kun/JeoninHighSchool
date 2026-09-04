@@ -44,10 +44,21 @@ int pwmA = 0, pwmB = 0, pwmC = 0, pwmD = 0;
 
 // 헤딩 보정 (Heading Lock) 전용 변수
 float targetHeading = 0.0;
-const float KP_HEADING = 3.0; // 각도 1도 오차당 목표 속도 보정량 (튜닝 가능)
+// 각도 1도 오차당 목표 속도 보정량 (튜닝 가능)
+// [실측] 3.0에서는 전진 정상오차 약 1도, 후진 약 4도로 수렴(발산은 아님).
+// 후진 편차가 전진의 약 3배라 같은 게인이면 정상오차도 3배로 남는다.
+const float KP_HEADING = 6.0;
+
+// 적분 게인: P만으로는 출발 시 생긴 오프셋을 되돌리지 못하고 정상오차로 남는다.
+// 그 오차가 다음 구간의 targetHeading으로 굳어져 누적되므로 I로 제거한다.
+// (0으로 두면 기존 P 전용 동작으로 되돌아감)
+const float KI_HEADING = 3.0;
+const float HEADING_I_LIMIT = 10.0; // 적분 누적 제한 (안티 와인드업)
+float headingIntegral = 0.0;
 
 // 각도 변수 (나노 BLE에서 YAW 수신)
 float yaw = 0;
+unsigned long lastYawTime = 0; // 마지막 YAW 수신 시점 (수신 두절 감지용)
 
 bool isCalibrated =
     true; // 나노가 부팅 시 칼리브레이션을 수행하므로 메가는 상시 참으로 시작
@@ -152,6 +163,9 @@ SimplePID pidD(0.3, 0.02, 0.08);
 // 각 바퀴의 현재 회전 방향 (+1: 전진, -1: 후진, 0: 정지)
 int dirSignA = 0, dirSignB = 0, dirSignC = 0, dirSignD = 0;
 
+// 직진/후진 주행 모드의 진행 방향 (+1: 전진, -1: 후진, 0: 미주행)
+int driveDir = 0;
+
 void motorDrive(int pwmPin, int d1, int d2, int pwm) {
   pwm = constrain(pwm, -255, 255);
 
@@ -218,24 +232,28 @@ void TURN_LEFT(int speed = 0) {
 }
 
 void BACK() {
-  motorDrive(PWMA, DIRA1, DIRA2, Motor_PWM);
-  motorDrive(PWMB, DIRB1, DIRB2, -Motor_PWM);
-  motorDrive(PWMC, DIRC1, DIRC2, Motor_PWM);
-  motorDrive(PWMD, DIRD1, DIRD2, -Motor_PWM);
+  motorDrive(PWMA, DIRA1, DIRA2, pwmA);
+  motorDrive(PWMB, DIRB1, DIRB2, -pwmB);
+  motorDrive(PWMC, DIRC1, DIRC2, pwmC);
+  motorDrive(PWMD, DIRD1, DIRD2, -pwmD);
 }
 
-void initStraightMode() {
+void initStraightMode(int dir = 1) { // dir: +1 전진, -1 후진
   pidA.reset();
   pidB.reset();
   pidC.reset();
   pidD.reset();
+  driveDir = dir;
+  headingIntegral = 0.0; // 구간마다 적분 초기화
   targetSpeed = (float)Motor_PWM;
   currentBasePWM = 40; // 최소 기동 토크(부드러운 가속 시작점)
   pwmA = pwmB = pwmC = pwmD = currentBasePWM;
   encA = encB = encC = encD = 0;
   lastSpeedTime = millis();
-  targetHeading = yaw; // ★ 직진 시작 시점의 각도를 목표 헤딩으로 기억
-  Serial.print("PID/가감속/헤딩락 초기화 (목표 각도: ");
+  targetHeading = yaw; // ★ 직진/후진 시작 시점의 각도를 목표 헤딩으로 기억
+  Serial.print("PID/가감속/헤딩락 초기화 (");
+  Serial.print(dir > 0 ? "전진" : "후진");
+  Serial.print(", 목표 각도: ");
   Serial.print(targetHeading, 1);
   Serial.println("도)");
 }
@@ -272,18 +290,34 @@ void print_all_data(uint32_t t) {
   Serial.print(pose.y, 3);
   Serial.println("m");
 
-  // ★ 직진 주행 중일 때 헤딩 락 실시간 보정 상태 출력
-  if (pwmA > 0 && !isTurning) {
+  // ★ 나노 YAW 수신 상태 점검 (수신이 끊기면 헤딩락이 조용히 무력화된다)
+  if (lastYawTime == 0 || (t - lastYawTime) > 1000) {
+    Serial.print("  [경고] 나노 YAW 수신 없음 (");
+    if (lastYawTime == 0) {
+      Serial.print("부팅 후 한 번도 수신 못함");
+    } else {
+      Serial.print((t - lastYawTime) / 1000.0, 1);
+      Serial.print("초 경과");
+    }
+    Serial.println(") - 헤딩락 비활성. 나노 IMU/배선 확인 필요");
+  }
+
+  // ★ 직진/후진 주행 중일 때 헤딩 락 실시간 보정 상태 출력
+  if (pwmA > 0 && !isTurning && driveDir != 0) {
     float hErr = targetHeading - yaw;
     if (hErr > 180.0)
       hErr -= 360.0;
     if (hErr < -180.0)
       hErr += 360.0;
-    Serial.print("  └─► [H-Lock] 목표: ");
+    Serial.print("  └─► [H-Lock ");
+    Serial.print(driveDir > 0 ? "전진" : "후진");
+    Serial.print("] 목표: ");
     Serial.print(targetHeading, 1);
     Serial.print("° (오차: ");
     Serial.print(hErr, 1);
-    Serial.print("°) | 좌측PWM(A): ");
+    Serial.print("°, 적분: ");
+    Serial.print(headingIntegral, 1);
+    Serial.print(") | 좌측PWM(A): ");
     Serial.print(pwmA);
     Serial.print("  우측PWM(B): ");
     Serial.println(pwmB);
@@ -361,6 +395,7 @@ void processCommand(String cmd, uint32_t now) {
         currentBasePWM = 0;
         STOP();
         isTurning = false;
+        driveDir = 0;
         pwmA = pwmB = pwmC = pwmD = 0;
         Serial.println("정지 명령(STOP) 수신 및 정지 완료");
       } else if (sSignal == "0") {
@@ -382,6 +417,7 @@ void processCommand(String cmd, uint32_t now) {
           Serial.println(target);
 
           STOP();
+          driveDir = 0;
           pwmA = pwmB = pwmC = pwmD = 0;
           delay(100);
           destinationAngle = yaw + target;
@@ -405,6 +441,7 @@ void processCommand(String cmd, uint32_t now) {
     currentBasePWM = 0;
     STOP();
     isTurning = false;
+    driveDir = 0;
     pwmA = pwmB = pwmC = pwmD = 0;
     Serial.println("정지 명령(STOP) 수신 및 정지 완료");
   } else if (cmd == "0") {
@@ -435,6 +472,7 @@ void processCommand(String cmd, uint32_t now) {
         Serial.println(target);
 
         STOP();
+        driveDir = 0;
         pwmA = pwmB = pwmC = pwmD = 0;
         delay(100);
         destinationAngle = yaw + target;
@@ -510,6 +548,7 @@ void loop() {
 
   // ── PS2 컨트롤러 처리 ──────────────────────────────────
   static bool wasPs2Advancing = false;
+  static bool wasPs2Backing = false;
   bool ps2Controlled = false;
   if (ps2_error == 0 && ps2_type != 2) {
     ps2x.read_gamepad(false, vibrate);
@@ -531,6 +570,7 @@ void loop() {
       // ── 직진 (헤딩 보정 및 PID 적용) ──
       if (ps2x.Button(PSB_START) || ps2x.Button(PSB_PAD_UP) ||
           ps2x.Button(PSB_GREEN)) {
+        wasPs2Backing = false;
         Motor_PWM = 125;
         if (!wasPs2Advancing || pwmA == 0) {
           initStraightMode(); // 헤딩 락 기준 각도 캡처 및 PID 리셋
@@ -539,21 +579,30 @@ void loop() {
         ADVANCE();
       } else if (ps2x.Button(PSB_PAD_DOWN) || ps2x.Button(PSB_BLUE)) {
         wasPs2Advancing = false;
-        pwmA = 0;
         Motor_PWM = 125;
+        if (!wasPs2Backing || pwmA == 0) {
+          initStraightMode(-1); // 헤딩 락 기준 각도 캡처 및 PID 리셋 (후진)
+          wasPs2Backing = true;
+        }
         BACK();
       } else if (ps2x.Button(PSB_PAD_LEFT) || ps2x.Button(PSB_PINK)) {
         wasPs2Advancing = false;
+        wasPs2Backing = false;
+        driveDir = 0;
         pwmA = 0;
         Motor_PWM = 125;
         TURN_LEFT();
       } else if (ps2x.Button(PSB_PAD_RIGHT) || ps2x.Button(PSB_RED)) {
         wasPs2Advancing = false;
+        wasPs2Backing = false;
+        driveDir = 0;
         pwmA = 0;
         Motor_PWM = 125;
         TURN_RIGHT();
       } else if (ps2x.Button(PSB_SELECT)) {
         wasPs2Advancing = false;
+        wasPs2Backing = false;
+        driveDir = 0;
         currentBasePWM = 0;
         pwmA = pwmB = pwmC = pwmD = 0;
         STOP();
@@ -563,28 +612,38 @@ void loop() {
 
         if (LY < 127) { // 아날로그 전진 (헤딩 보정 적용)
           Motor_PWM = 1.5 * (127 - LY);
+          wasPs2Backing = false;
           if (!wasPs2Advancing || pwmA == 0) {
             initStraightMode();
             wasPs2Advancing = true;
           }
           ADVANCE();
-        } else if (LY > 127) {
+        } else if (LY > 127) { // 아날로그 후진 (헤딩 보정 적용)
           wasPs2Advancing = false;
-          pwmA = 0;
           Motor_PWM = 1.5 * (LY - 128);
+          if (!wasPs2Backing || pwmA == 0) {
+            initStraightMode(-1);
+            wasPs2Backing = true;
+          }
           BACK();
         } else if (LX < 128) {
           wasPs2Advancing = false;
+          wasPs2Backing = false;
+          driveDir = 0;
           pwmA = 0;
           Motor_PWM = 1.5 * (127 - LX);
           TURN_LEFT();
         } else if (LX > 128) {
           wasPs2Advancing = false;
+          wasPs2Backing = false;
+          driveDir = 0;
           pwmA = 0;
           Motor_PWM = 1.5 * (LX - 128);
           TURN_RIGHT();
         } else {
           wasPs2Advancing = false;
+          wasPs2Backing = false;
+          driveDir = 0;
           currentBasePWM = 0;
           pwmA = pwmB = pwmC = pwmD = 0;
           STOP();
@@ -594,11 +653,43 @@ void loop() {
     } else {
       if (wasPs2Controlled) {
         wasPs2Advancing = false;
+        wasPs2Backing = false;
+        driveDir = 0;
         currentBasePWM = 0;
         pwmA = pwmB = pwmC = pwmD = 0;
         STOP();
         wasPs2Controlled = false;
       }
+    }
+  }
+
+  // ── 나노(Serial2) 수신: PS2 조작 중에도 반드시 실행 ────────────
+  // yaw를 여기서만 갱신하므로, 이 블록이 막히면 헤딩락이 정지된 각도로
+  // 동작해 보정이 전혀 이뤄지지 않는다. (주행 명령만 수동 조작 중 무시)
+  static String inputBuffer2 = "";
+  while (isCalibrated && Serial2.available() > 0) {
+    char c = Serial2.read();
+    if (c == '\n') {
+      inputBuffer2.trim();
+      if (inputBuffer2.length() > 0) {
+        // YAW 데이터 파싱 (나노로부터 공급받음)
+        if (inputBuffer2.startsWith("YAW:")) {
+          float tempYaw = inputBuffer2.substring(4).toFloat();
+          if (!isnan(tempYaw) && !isinf(tempYaw)) {
+            yaw = tempYaw;
+            lastRecvTime = now; // 워치독 타이머 갱신
+            lastYawTime = now;  // YAW 수신 상태 갱신
+          }
+        } else if (!ps2Controlled) {
+          // PS2 수동 조작 중에는 자동 주행 명령을 무시
+          processCommand(inputBuffer2, now);
+        }
+      }
+      inputBuffer2 = "";
+    } else if (c != '\r') {
+      inputBuffer2 += c;
+      if (inputBuffer2.length() > 100)
+        inputBuffer2 = "";
     }
   }
 
@@ -635,8 +726,8 @@ void loop() {
     speedD = (abs(cD) / 10.0) / dt;
     lastSpeedTime = now;
 
-    // 직진 주행 중일 때 100ms 주기로 PID 연산 및 출력 반영 (자동/리모컨 공통)
-    if (!isTurning && pwmA > 0) {
+    // 직진/후진 주행 중일 때 100ms 주기로 PID 연산 및 출력 반영 (자동/리모컨 공통)
+    if (!isTurning && driveDir != 0 && pwmA > 0) {
       // ── 1. 가감속(Ramp) 점진적 속도 증가/감소 (목표: Motor_PWM) ──
       if (currentBasePWM < Motor_PWM) {
         currentBasePWM = min(currentBasePWM + RAMP_ACCEL_STEP, Motor_PWM);
@@ -651,14 +742,23 @@ void loop() {
       if (headingError < -180.0)
         headingError += 360.0;
 
+      // 적분 누적 (출발 시 생긴 오프셋을 시간이 지나며 되돌리는 역할)
+      headingIntegral += headingError * dt;
+      headingIntegral =
+          constrain(headingIntegral, -HEADING_I_LIMIT, HEADING_I_LIMIT);
+
       // 헤딩 보정량 계산 (오차가 클 때 과도한 보정 방지를 위해 ±30.0으로 제한)
       float headingCorrection =
-          constrain(headingError * KP_HEADING, -30.0f, 30.0f);
+          constrain(headingError * KP_HEADING + headingIntegral * KI_HEADING,
+                    -30.0f, 30.0f);
 
       // 좌/우 바퀴의 목표 속도 차등 적용
-      // (차체가 오른쪽으로 틀어지면 headingError < 0 -> 좌측 증속, 우측 감속)
-      float targetSpeedLeft = (float)Motor_PWM - headingCorrection;
-      float targetSpeedRight = (float)Motor_PWM + headingCorrection;
+      // [실측 검증] 전진 중 우측을 증속하면 yaw가 감소한다. 따라서 yaw를
+      // 올려야 하는 상황(headingError > 0)에서는 좌측을 증속해야 한다.
+      // 후진 시에는 바퀴 회전 방향이 반대라 좌/우 속도차가 yaw에 반대 부호로
+      // 작용하므로, driveDir을 곱해 보정 방향을 다시 반전시킨다.
+      float targetSpeedLeft = (float)Motor_PWM + driveDir * headingCorrection;
+      float targetSpeedRight = (float)Motor_PWM - driveDir * headingCorrection;
 
       float corrA =
           constrain(pidA.compute(targetSpeedLeft, speedA), -70.0, 70.0);
@@ -674,7 +774,10 @@ void loop() {
       pwmC = constrain(currentBasePWM + (int)corrC, 0, 255);
       pwmD = constrain(currentBasePWM + (int)corrD, 0, 255);
 
-      ADVANCE();
+      if (driveDir > 0)
+        ADVANCE();
+      else
+        BACK();
     }
   }
 
@@ -685,38 +788,13 @@ void loop() {
         currentBasePWM = 0;
         STOP();
         isTurning = false;
+        driveDir = 0;
         pwmA = pwmB = pwmC = pwmD = 0;
         static unsigned long lastWdLog = 0;
         if (now - lastWdLog > 2000) {
           lastWdLog = now;
           Serial.println("[경고] 통신 두절로 인한 비상 정지 (Watchdog)");
         }
-      }
-    }
-
-    // ── PC/나노 명령 논블로킹(Non-blocking) 수신 (Serial2: 나노, Serial: PC USB) ──
-    static String inputBuffer2 = "";
-    while (isCalibrated && Serial2.available() > 0) {
-      char c = Serial2.read();
-      if (c == '\n') {
-        inputBuffer2.trim();
-        if (inputBuffer2.length() > 0) {
-          // YAW 데이터 파싱 (나노로부터 공급받음)
-          if (inputBuffer2.startsWith("YAW:")) {
-            float tempYaw = inputBuffer2.substring(4).toFloat();
-            if (!isnan(tempYaw) && !isinf(tempYaw)) {
-              yaw = tempYaw;
-              lastRecvTime = now; // 워치독 타이머 갱신
-            }
-          } else {
-            processCommand(inputBuffer2, now);
-          }
-        }
-        inputBuffer2 = "";
-      } else if (c != '\r') {
-        inputBuffer2 += c;
-        if (inputBuffer2.length() > 100)
-          inputBuffer2 = "";
       }
     }
 
