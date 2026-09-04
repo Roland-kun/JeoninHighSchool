@@ -589,6 +589,33 @@ class PathRecommender:
         dist_m, goal_rel_angle, goal_global_angle = self._compute_goal_vector()
         has_goal = (dist_m is not None and goal_rel_angle is not None)
 
+        # ── 0. 목표 도착 상태 최우선 처리 (방향 추천 일체 없이 오직 정지 신호만 전송) ──
+        if self.state == "GOAL_REACHED" or (has_goal and dist_m <= self.ARRIVE_MARGIN_M):
+            self.state = "GOAL_REACHED"
+            self.avoid_state = "IDLE"
+            self.aligning_heading = False
+            self._send_stop_packet(reset_odo=False)
+            return PathRecommendation(
+                best_angle_deg=self.STOP_ANGLE,
+                best_label="STOP",
+                reason=f"목표 {self.target_name or 'Goal'} 도착 완료! 정지 상태 유지 (BLE: STOP 신호 송신)",
+                scores=[],  # 방향 추천 없음
+                is_stuck=False,
+                target_x=self.target_x,
+                target_y=self.target_y,
+                target_name=self.target_name,
+                dist_to_goal_m=dist_m,
+                goal_rel_angle_deg=goal_rel_angle,
+                is_goal_reached=True,
+                robot_x=self.robot_x,
+                robot_y=self.robot_y,
+                robot_heading_deg=self.robot_heading_deg,
+                obs_w=0.0,
+                obs_l=0.0,
+                target_avoid_w=0.0,
+                target_avoid_l=0.0,
+            )
+
         # 1. 19방향 스코어링 수행 (직진 우대 가중치 및 목표 지향성 반영)
         scores: List[DirectionScore] = []
         for angle_deg, label in self.DIRECTIONS:
@@ -625,32 +652,6 @@ class PathRecommender:
         # 전방 0도 안전 거리
         front_clearance = scores[0].clearance_m
 
-        # ── 0. 목표 도착 여부 최우선 판단 ──
-        if has_goal and dist_m <= self.ARRIVE_MARGIN_M:
-            self.state = "GOAL_REACHED"
-            self.aligning_heading = False
-            self._send_stop_packet(reset_odo=False)
-            return PathRecommendation(
-                best_angle_deg=self.STOP_ANGLE,
-                best_label="Arrived",
-                reason=f"목표 {self.target_name} 도착 완료! ({dist_m:.2f}m 이내)",
-                scores=scores,
-                is_stuck=False,
-                target_x=self.target_x,
-                target_y=self.target_y,
-                target_name=self.target_name,
-                dist_to_goal_m=dist_m,
-                goal_rel_angle_deg=goal_rel_angle,
-                is_goal_reached=True,
-                robot_x=self.robot_x,
-                robot_y=self.robot_y,
-                robot_heading_deg=self.robot_heading_deg,
-                obs_w=self.obs_measured_w,
-                obs_l=self.obs_measured_l,
-                target_avoid_w=self.target_avoid_width_m,
-                target_avoid_l=self.target_avoid_length_m,
-            )
-
         # ── 1. FORWARD 상태 ──
         if self.state == "FORWARD":
             if has_goal:
@@ -666,9 +667,9 @@ class PathRecommender:
                     self._send_stop_packet(reset_odo=False)
                     return PathRecommendation(
                         best_angle_deg=self.STOP_ANGLE,
-                        best_label="Arrived",
-                        reason=f"목표 {self.target_name} 도착 완료! (오차 {dist_to_goal:.2f}m)",
-                        scores=scores,
+                        best_label="STOP",
+                        reason=f"목표 {self.target_name or 'Goal'} 도착 완료! (오차 {dist_to_goal:.2f}m) 정지 상태 유지 (BLE: STOP 신호 송신)",
+                        scores=[],
                         is_stuck=False,
                         target_x=self.target_x,
                         target_y=self.target_y,
@@ -925,9 +926,9 @@ class PathRecommender:
                             self._send_stop_packet(reset_odo=False)
                             return PathRecommendation(
                                 best_angle_deg=self.STOP_ANGLE,
-                                best_label="Arrived",
-                                reason=f"목표 {self.target_name} 도착 완료! (오차 {dist_to_goal:.2f}m)",
-                                scores=scores,
+                                best_label="STOP",
+                                reason=f"목표 {self.target_name or 'Goal'} 도착 완료! (오차 {dist_to_goal:.2f}m) 정지 상태 유지 (BLE: STOP 신호 송신)",
+                                scores=[],
                                 is_stuck=False,
                                 target_x=self.target_x,
                                 target_y=self.target_y,

@@ -343,8 +343,19 @@ def test_scenario_10_target_coordinate_navigation():
     print(f"BLE Sent: {mock_ble.sent_messages}")
     assert rec2.is_goal_reached == True
     assert recommender.state == "GOAL_REACHED"
+    assert rec2.best_angle_deg == recommender.STOP_ANGLE
+    assert len(rec2.scores) == 0, "도착 시에는 19방향 점수/추천이 없어야 합니다."
     assert any('"S-signal": "STOP"' in msg for msg in mock_ble.sent_messages)
-    print(">>> 시나리오 10 (0.1m 오차 도착) 통과!\n")
+
+    # 3. 도착 후 다음 프레임에서도 계속 STOP 신호만 나가고 방향 추천을 일체 하지 않는지 확인
+    mock_ble.sent_messages.clear()
+    rec3 = recommender.recommend()
+    assert rec3.is_goal_reached == True
+    assert recommender.state == "GOAL_REACHED"
+    assert rec3.best_angle_deg == recommender.STOP_ANGLE
+    assert len(rec3.scores) == 0
+    assert mock_ble.sent_messages[-1] == '{"S-signal": "STOP", "R-signal": ""}'
+    print(">>> 시나리오 10 (0.1m 오차 도착 & 오직 정지 신호만 송신) 통과!\n")
 
 def test_scenario_11_stop_navigation_button():
     print("=" * 60)
