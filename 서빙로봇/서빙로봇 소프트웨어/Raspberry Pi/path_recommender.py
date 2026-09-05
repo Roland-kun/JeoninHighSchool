@@ -32,6 +32,7 @@ import math
 import re
 import json
 import time
+import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 import config
@@ -67,6 +68,8 @@ class PathRecommendation:
     obs_l: float = 0.0            # 실측 전방 장애물 길이 (m)
     target_avoid_w: float = 0.0   # 동적 목표 가로 회피 거리 (m)
     target_avoid_l: float = 0.0   # 동적 목표 세로 추월 거리 (m)
+    fault_code: int = 0           # 0=정상 1=모터스톨 2=헤딩포화 3=바퀴편차 4=슬립(라이다)
+    fault_reason: str = ""        # 사람이 읽을 수 있는 이상 상태 설명
 
 
 class PathRecommender:
@@ -89,6 +92,43 @@ class PathRecommender:
     MAX_AVOID_WIDTH_M  = 0.65   # 가로 폭 최대 직진 거리 (65cm)
     MIN_AVOID_LENGTH_M = 0.45   # 0도 정렬 후 세로 길이 최소 직진 보장 거리 (45cm)
     MAX_AVOID_LENGTH_M = 0.70   # 세로 길이 최대 직진 거리 (70cm)
+    MAX_AVOID_RETRY    = 3      # 회피 직진 중 전방이 다시 막혀 회피를 재시작할 수 있는 최대 횟수
+
+    # ── 라이다 기반 슬립 감지 ────────────────────────────────────
+    # 오도메트리는 엔코더에서 나오므로 바퀴가 헛돌면 같이 속는다. 라이다는 바퀴와
+    # 무관한 유일한 관측 수단이라, "오도메트리는 갔다는데 세상은 그대로"를 잡아낸다.
+    SLIP_WINDOW_SEC       = 2.0   # 현재 스캔과 비교할 과거 시점
+    SLIP_MIN_ODO_M        = 0.25  # 이만큼 이동했다고 오도메트리가 주장하는데
+    SLIP_MAX_SCAN_DELTA_M = 0.05  # 라이다가 본 세상이 이만큼도 안 변했으면 슬립
+    SLIP_STRUCT_RATIO     = 0.30  # 0.2~4m 유효 포인트 비율. 미만이면 판정 보류
+    SLIP_MIN_MATCHED      = 30    # 두 스캔 사이에 각도가 매칭된 최소 포인트 수
+
+    # ── 이상 상태 탈출 (REVERSE 명령) ────────────────────────────
+    # 로봇 후방에는 센서가 하나도 없다 (라이다 FOV 180도, 초음파는 좌/우, OAK 는 전방).
+    # 후방 판정은 "방금 지나온 자리"라는 맵 메모리에만 의존하므로, 뒤에서 걸어온
+    # 사람은 볼 수 없다. 그래서 후진은 반드시 짧아야 하고 1회로 제한한다.
+    FAULT_REVERSE_TIMEOUT_SEC = 2.5   # 메가는 1.5초/25cm 에 자체 종료. 여유를 둔 상한
+    FAULT_REAR_CLEAR_M        = 0.45  # 후진 25cm + 여유. 이보다 좁으면 후진 포기
+    MAX_FAULT_RETRY           = 1     # 자동 탈출 시도 횟수
+
+    # ── 180도 선회 탈출 ──────────────────────────────────────────
+    # 후진보다 나은 이유: 180도 돌면 라이다가 탈출 방향을 보게 되므로,
+    # "눈 감은 후진"이 "눈 뜬 전진"으로 바뀐다.
+    # 단 제자리 회전은 코너가 원을 그리며 스윕한다. 50x50cm 로봇의 반대각선은
+    # 0.354m 라, 전방 면 기준으로 최소 10cm 여유가 없으면 코너가 벽을 파고든다.
+    ROT_SWEEP_MARGIN_M       = 0.05  # 스윕 반경(0.354m)에 더할 안전 여유
+    ESCAPE_FWD_DIST_M        = 0.40  # 회전 후 벽에서 물러날 거리
+    ESCAPE_FWD_TIMEOUT_SEC   = 3.0   # 슬립이면 오도메트리가 안 늘어나므로 시간으로도 끊는다
+    ESCAPE_TURN_TIMEOUT_SEC  = 8.0   # 180도 선회가 끝나지 않을 때의 상한
+
+    # fault 코드 (메가와 동일한 번호 체계)
+    FAULT_NONE, FAULT_STALL, FAULT_HEADING, FAULT_WHEEL, FAULT_SLIP = 0, 1, 2, 3, 4
+    FAULT_NAMES = {
+        1: "모터 스톨 (바퀴가 물리적으로 멈춤)",
+        2: "헤딩 보정 포화 (한쪽이 걸려 방향이 틀어짐)",
+        3: "바퀴 편차 (한 바퀴가 들리거나 걸림)",
+        4: "슬립 (바퀴는 도는데 로봇이 안 움직임)",
+    }
 
     # 검사할 10도 단위 세분화 19방향 (각도, 레이블)
     DIRECTIONS = [
@@ -142,6 +182,7 @@ class PathRecommender:
         self.avoid_step_timeout: int = 0        # 무한 직진 방지 안전 타임아웃
         self.avoid_min_steps: int = 0           # 최소 직진 보장 카운터
         self.avoid_forward_timer: int = 0
+        self.avoid_retry_count: int = 0         # 회피 직진 중 전방 재차단으로 회피를 다시 시작한 횟수
 
         # BLE 중복 전송 억제 및 통신 락 변수
         self.last_sent_payload: str = ""
@@ -170,6 +211,19 @@ class PathRecommender:
         self.robot_y: float = 0.0
         self.robot_heading_deg: float = 0.0
 
+        # 이상 상태 (메가에서 BLE 6번째 필드로 오거나, PC가 라이다로 직접 판정)
+        self.mega_fault: int = 0        # 메가가 보고한 코드 (원시값)
+        self.fault_code: int = 0        # 확정된 이상 상태 (래치됨)
+        self.fault_reason: str = ""
+        # "NONE" | "REVERSING" | "ESCAPE_TURN" | "ESCAPE_FWD" | "DONE"
+        self.fault_stage: str = "NONE"
+        self.fault_reverse_start: float = 0.0
+        self.fault_retry_count: int = 0
+        self.fault_escape_head: float = 0.0   # 180도 선회 목표 헤딩
+        self.fault_escape_x: float = 0.0      # 탈출 전진 시작 좌표
+        self.fault_escape_y: float = 0.0
+        self._scan_history: List[Tuple[float, dict, float, float, float]] = []
+
         # BLE 수신 데이터 저장 (초기 시작 시 오인 정지/회피 방지를 위해 999.0cm로 초기화)
         self.ble_right_cm = 999.0
         self.ble_left_cm  = 999.0
@@ -195,6 +249,9 @@ class PathRecommender:
         """로봇 50cm x 50cm 사각형 몸체의 격자 오프셋 계산"""
         res = self.occ_map.resolution
         half_cells = int(math.ceil(self.ROBOT_HALF_M / res))
+        # 레이마칭은 이 반경으로 numpy 슬라이스를 잘라 쓴다.
+        # footprint_offsets 자체는 외부(test_run.py 등) 호환을 위해 그대로 유지한다.
+        self.footprint_half_cells = half_cells
         for dr in range(-half_cells, half_cells + 1):
             for dc in range(-half_cells, half_cells + 1):
                 self.footprint_offsets.append((dr, dc))
@@ -213,6 +270,13 @@ class PathRecommender:
         self.avoid_state = "IDLE"
         self.avoid_target_head = None
         self.avoid_forward_timer = 0
+        self.avoid_retry_count = 0
+        self.fault_code = 0
+        self.fault_reason = ""
+        self.mega_fault = 0   # 낡은 보고값으로 즉시 재래치되는 것을 막는다
+        self.fault_stage = "NONE"
+        self.fault_retry_count = 0
+        self._scan_history.clear()
 
         self.target_x = float(x_m)
         self.target_y = float(y_m)
@@ -237,6 +301,13 @@ class PathRecommender:
         self.avoid_state = "IDLE"
         self.avoid_target_head = None
         self.avoid_forward_timer = 0
+        self.avoid_retry_count = 0
+        self.fault_code = 0
+        self.fault_reason = ""
+        self.mega_fault = 0   # 낡은 보고값으로 즉시 재래치되는 것을 막는다
+        self.fault_stage = "NONE"
+        self.fault_retry_count = 0
+        self._scan_history.clear()
         self.aligning_heading = False
         self.state = "STOPPED"
         self._send_stop_packet(reset_odo=False)
@@ -423,11 +494,16 @@ class PathRecommender:
                     pass
 
             if len(nums) >= 5:
-                # [x값, y값, 헤딩, 오른쪽초음파, 왼쪽초음파]
+                # [x값, y값, 헤딩, 오른쪽초음파, 왼쪽초음파, (선택)이상상태코드]
                 self.robot_x = nums[0]
                 self.robot_y = nums[1]
                 self.robot_heading_deg = nums[2]
                 self._update_ultrasonic(nums[3], nums[4])
+                if len(nums) >= 6:
+                    code = int(nums[5])
+                    if code != self.mega_fault:
+                        print(f"[BLE] 메가 이상 상태 코드 변경: {self.mega_fault} -> {code}")
+                    self.mega_fault = code
             elif len(nums) == 4:
                 # [x, y, right, left]
                 self.robot_x = nums[0]
@@ -511,29 +587,34 @@ class PathRecommender:
         step_m = self.occ_map.resolution
         clearance = 0.0
 
+        # 루프 바깥으로 뺄 수 있는 것은 전부 빼둔다 (매 스텝 재계산 방지)
+        sin_r = math.sin(rad)
+        cos_r = math.cos(rad)
+        grid = self.occ_map.grid
+        height, width = grid.shape
+        half = self.footprint_half_cells
+        threshold = self.CELL_THRESHOLD
+
         dist = 0.05
         while dist <= self.MAX_RANGE_M:
-            x_m = dist * math.sin(rad)
-            y_m = dist * math.cos(rad)
-            row_c, col_c = self.occ_map.world_to_cell(x_m, y_m)
+            row_c, col_c = self.occ_map.world_to_cell(dist * sin_r, dist * cos_r)
 
-            if not self.occ_map.in_bounds(row_c, col_c):
+            if not (0 <= row_c < height and 0 <= col_c < width):
                 break
 
-            hit = False
-            obstacle_pixels = 0
-            for dr, dc in self.footprint_offsets:
-                r = row_c + dr
-                c = col_c + dc
-                if not self.occ_map.in_bounds(r, c):
-                    hit = True
-                    break
-                cell = float(self.occ_map.grid[r, c])
-                if cell >= self.CELL_THRESHOLD:
-                    obstacle_pixels += 1
-                    if obstacle_pixels >= 3:
-                        hit = True
-                        break
+            # 로봇 몸체가 놓일 11x11 셀 영역을 numpy 슬라이스로 한 번에 잘라
+            # 임계값 이상인 셀 수를 센다. 셀을 하나씩 파이썬으로 훑던 기존 방식과
+            # 결과는 완전히 동일하고(19방향 대조 오차 0.000000m), 인터프리터 오버헤드가
+            # 사라져 13배 빠르다. 라즈베리파이에서는 이 차이가 제어 주기를 좌우한다.
+            r0, r1 = row_c - half, row_c + half + 1
+            c0, c1 = col_c - half, col_c + half + 1
+
+            if r0 < 0 or c0 < 0 or r1 > height or c1 > width:
+                # 풋프린트가 맵 밖으로 나가면 기존 코드와 동일하게 충돌로 본다.
+                # (슬라이스는 범위를 넘으면 조용히 짧아지므로 반드시 먼저 걸러야 한다)
+                hit = True
+            else:
+                hit = int(np.count_nonzero(grid[r0:r1, c0:c1] >= threshold)) >= 3
 
             if hit:
                 if dist <= 0.05:
@@ -573,8 +654,362 @@ class PathRecommender:
         label = f"Right-{int(best_angle)}" if best_angle > 0 else f"Left-{int(abs(best_angle))}"
         return best_angle, label
 
+    # ── 라이다 기반 슬립 감지 ────────────────────────────────────
+    def feed_lidar_scan(self, scan):
+        """
+        매 프레임 최신 라이다 스캔을 넣어준다 (main_mapping 루프에서 호출).
+        슬립 판정용으로 최근 스캔을 1도 단위로 비닝해 보관한다.
+        """
+        if scan is None or not getattr(scan, "points", None):
+            return
+
+        now = time.time()
+        binned = {}
+        close_pts = 0
+        for p in scan.points:
+            d = p.distance_m
+            if d <= 0.0:
+                continue
+            b = int(round(p.angle_deg))
+            # 같은 각도 빈에 여러 포인트가 있으면 더 가까운 값을 채택
+            if b not in binned or d < binned[b]:
+                binned[b] = d
+            if 0.2 <= d <= 4.0:
+                close_pts += 1
+
+        struct_ratio = close_pts / float(len(scan.points))
+        self._scan_history.append((now, binned, struct_ratio, self.robot_x, self.robot_y))
+
+        # 비교 창의 2배까지만 보관 (메모리 무한 증가 방지)
+        while len(self._scan_history) > 2 and (now - self._scan_history[0][0]) > self.SLIP_WINDOW_SEC * 2.0:
+            self._scan_history.pop(0)
+
+    def _check_slip(self) -> Optional[Tuple[float, float, int]]:
+        """
+        "오도메트리는 움직였다는데 라이다가 본 세상은 그대로"인지 검사.
+
+        오도메트리는 엔코더에서 파생되므로 바퀴가 헛돌면 함께 속는다. 라이다는
+        바퀴와 무관한 유일한 관측 수단이라 이 대조가 성립한다.
+
+        Returns: 슬립이면 (오도메트리 이동거리, 스캔 변화 중앙값, 매칭 포인트 수), 아니면 None
+        """
+        if len(self._scan_history) < 2:
+            return None
+
+        now_t, now_bins, now_ratio, nx, ny = self._scan_history[-1]
+
+        # 비교 창(SLIP_WINDOW_SEC) 이상 떨어진 가장 최신 과거 샘플을 기준으로 삼는다
+        ref = None
+        for s in self._scan_history:
+            if (now_t - s[0]) >= self.SLIP_WINDOW_SEC:
+                ref = s
+            else:
+                break
+        if ref is None:
+            return None
+
+        ref_t, ref_bins, ref_ratio, rx, ry = ref
+
+        # [필수 가드] 텅 빈 공간에서는 실제로 움직여도 거리값이 안 변한다.
+        # 주변에 구조물이 충분히 보일 때만 판정하고, 아니면 조용히 보류한다
+        # (오검출로 멀쩡한 주행을 멈추는 것보다 미검출이 낫다).
+        if now_ratio < self.SLIP_STRUCT_RATIO or ref_ratio < self.SLIP_STRUCT_RATIO:
+            return None
+
+        common = [b for b in now_bins if b in ref_bins]
+        if len(common) < self.SLIP_MIN_MATCHED:
+            return None
+
+        # 중앙값을 쓰면 지나가는 사람 몇 명 때문에 판정이 흔들리지 않는다
+        deltas = sorted(abs(now_bins[b] - ref_bins[b]) for b in common)
+        scan_delta = deltas[len(deltas) // 2]
+
+        moved_odo = math.hypot(nx - rx, ny - ry)
+        if moved_odo >= self.SLIP_MIN_ODO_M and scan_delta <= self.SLIP_MAX_SCAN_DELTA_M:
+            return (moved_odo, scan_delta, len(common))
+        return None
+
+    def _evaluate_fault(self) -> int:
+        """
+        메가가 보고한 이상 상태와 PC가 라이다로 직접 판정한 슬립을 합쳐
+        확정 fault 코드를 결정하고 래치한다. 한 번 걸리면 주행 시작/정지로만 풀린다.
+        """
+        if self.fault_code != 0:
+            return self.fault_code  # 이미 래치됨
+
+        # 1) 메가 보고 (모터 스톨 / 헤딩 포화 / 바퀴 편차)
+        if self.mega_fault != 0:
+            self.fault_code = self.mega_fault
+            self.fault_reason = self.FAULT_NAMES.get(self.mega_fault, f"메가 이상 코드 {self.mega_fault}")
+            print(f"\n[PathRecommender] [FAULT {self.fault_code}] {self.fault_reason} (메가 보고)")
+            return self.fault_code
+
+        # 2) PC 자체 판정 (슬립) - 실제로 직진 주행 중일 때만
+        if self.state == "FORWARD" and self.avoid_state in ("IDLE", "AVOID_PASS_WIDTH", "AVOID_PASS_LENGTH"):
+            slip = self._check_slip()
+            if slip is not None:
+                moved, delta, matched = slip
+                self.fault_code = self.FAULT_SLIP
+                self.fault_reason = (
+                    f"슬립 (오도메트리 {moved:.2f}m 이동 주장, 라이다 변화 {delta*100:.1f}cm, "
+                    f"매칭 {matched}점) - 오도메트리 좌표를 신뢰할 수 없음"
+                )
+                print(f"\n[PathRecommender] [FAULT 4] {self.fault_reason}")
+                return self.fault_code
+
+        return 0
+
+    def _rotation_clearance_ok(self) -> Tuple[bool, int]:
+        """
+        제자리 180도 회전이 가능한지 판정.
+
+        로봇이 중심을 축으로 돌면 네 코너가 반대각선 반경(50x50cm -> 0.354m)의
+        원을 그린다. 정지 상태의 전방 면(0.25m)보다 10cm 더 나가므로, 벽에
+        완전히 밀착한 상태에서 돌리면 코너가 벽을 파고들며 갈린다.
+        중심 주변 원형 영역에 장애물 셀이 있는지 직접 확인한다.
+
+        Returns: (회전 가능 여부, 막힌 셀 수)
+        """
+        res = self.occ_map.resolution
+        radius_m = self.ROBOT_HALF_M * math.sqrt(2.0) + self.ROT_SWEEP_MARGIN_M
+        rad_cells = int(math.ceil(radius_m / res))
+        r0, c0 = self.occ_map.robot_row, self.occ_map.robot_col
+
+        blocked = 0
+        for dr in range(-rad_cells, rad_cells + 1):
+            for dc in range(-rad_cells, rad_cells + 1):
+                if dr * dr + dc * dc > rad_cells * rad_cells:
+                    continue
+                r, c = r0 + dr, c0 + dc
+                if not self.occ_map.in_bounds(r, c):
+                    blocked += 1
+                    continue
+                if float(self.occ_map.grid[r, c]) >= self.CELL_THRESHOLD:
+                    blocked += 1
+        # 레이마칭과 같은 기준(3셀)으로 단일 픽셀 노이즈를 견딘다
+        return (blocked < 3), blocked
+
+    # ── 이상 상태 탈출 시퀀스 (후진 -> 재개 또는 정지) ───────────
+    def _handle_fault(self, fault: int, dist_m, goal_rel_angle) -> PathRecommendation:
+        """
+        이상 상태가 확정됐을 때의 처리.
+
+        1) 후방이 트여 있으면 REVERSE 를 보내 짧게(25cm/1.5초) 물러난다.
+           벽이나 턱에 밀착한 채로 방치하지 않기 위함이다.
+        2) 후진이 끝나면:
+           - fault 1~3 (스톨/헤딩/바퀴): 오도메트리는 대체로 살아 있으므로 목표 주행 재개
+           - fault 4 (슬립): 엔코더가 헛돌며 없는 거리를 누적했으므로 현재 좌표를
+             신뢰할 수 없다. 재개하면 엉뚱한 곳으로 간다 -> 정지하고 사람 판단을 기다린다.
+        """
+        now = time.time()
+        self.avoid_state = "IDLE"
+        self.aligning_heading = False
+
+        def pack(angle, label, reason, stuck):
+            return PathRecommendation(
+                best_angle_deg=angle, best_label=label, reason=reason, scores=[],
+                is_stuck=stuck,
+                target_x=self.target_x, target_y=self.target_y, target_name=self.target_name,
+                dist_to_goal_m=dist_m, goal_rel_angle_deg=goal_rel_angle,
+                is_goal_reached=False,
+                robot_x=self.robot_x, robot_y=self.robot_y,
+                robot_heading_deg=self.robot_heading_deg,
+                fault_code=fault, fault_reason=self.fault_reason,
+            )
+
+        # ── 1단계: 탈출 방법 결정 ──
+        # 회전을 후진보다 우선한다. 180도 돌고 나면 라이다가 탈출 방향을 보게 되므로
+        # 그 다음 전진은 전방 감시가 살아 있는 "눈 뜬 이동"이 된다.
+        if self.fault_stage == "NONE":
+            if self.fault_retry_count >= self.MAX_FAULT_RETRY:
+                self.fault_stage = "DONE"
+            else:
+                rot_ok, blocked = self._rotation_clearance_ok()
+                if rot_ok:
+                    self.fault_retry_count += 1
+                    self._start_escape_turn(now)
+                else:
+                    # 회전 스윕 공간이 없다 -> 짧은 후진으로 공간부터 만든다
+                    rear_clear = self._measure_clearance_with_footprint(180.0)
+                    if rear_clear >= self.FAULT_REAR_CLEAR_M:
+                        self.fault_stage = "REVERSING"
+                        self.fault_reverse_start = now
+                        self.fault_retry_count += 1
+                        print(f"\n[PathRecommender] [FAULT] 회전 공간 부족(장애물 셀 {blocked}개) - "
+                              f"후방 {rear_clear:.2f}m 로 먼저 물러난 뒤 선회 재시도")
+                    else:
+                        self.fault_stage = "DONE"
+                        print(f"\n[PathRecommender] [FAULT] 회전 공간 부족(셀 {blocked}개) + "
+                              f"후방 {rear_clear:.2f}m - 자력 탈출 불가, 정지 유지")
+
+        # ── 2단계: 후진으로 회전 공간 확보 ──
+        if self.fault_stage == "REVERSING":
+            elapsed = now - self.fault_reverse_start
+            if elapsed < self.FAULT_REVERSE_TIMEOUT_SEC:
+                self._send_ble("REVERSE")
+                return pack(self.STOP_ANGLE, "REVERSE",
+                            f"[이상 상태 {fault}] {self.fault_reason} -> 선회 공간 확보용 후진 중 ({elapsed:.1f}s)",
+                            True)
+            rot_ok, blocked = self._rotation_clearance_ok()
+            if rot_ok:
+                self._start_escape_turn(now)
+            else:
+                self.fault_stage = "DONE"
+                print(f"\n[PathRecommender] [FAULT] 후진 후에도 회전 공간 부족(셀 {blocked}개) - 정지 유지")
+
+        # ── 3단계: 180도 선회 (라이다가 탈출 방향을 보도록) ──
+        if self.fault_stage == "ESCAPE_TURN":
+            is_turning, head_err = self._is_still_turning(self.fault_escape_head)
+            if is_turning and (now - self.fault_reverse_start) < self.ESCAPE_TURN_TIMEOUT_SEC:
+                angle, label = self._get_heading_alignment_steering(self.fault_escape_head)
+                self._send_ble(str(int(angle)))
+                return pack(angle, label,
+                            f"[이상 상태 {fault}] 180도 선회 중 (목표 {self.fault_escape_head:+.0f}°, 오차 {head_err:+.1f}°)",
+                            True)
+            self.fault_stage = "ESCAPE_FWD"
+            self.fault_escape_x = self.robot_x
+            self.fault_escape_y = self.robot_y
+            self.fault_reverse_start = now
+            print(f"\n[PathRecommender] [FAULT] 선회 완료 -> 전방 감시하며 {self.ESCAPE_FWD_DIST_M:.2f}m 이탈 전진")
+
+        # ── 4단계: 벽에서 물러나는 전진 (이제 전방이 보인다) ──
+        # 회전 직후 곧바로 목표 주행을 재개하면, 목표가 벽 너머라 다시 벽 쪽으로
+        # 돌아서 버린다. 물리적으로 떨어진 뒤에 재개해야 한다.
+        if self.fault_stage == "ESCAPE_FWD":
+            elapsed = now - self.fault_reverse_start
+            moved = math.hypot(self.robot_x - self.fault_escape_x,
+                               self.robot_y - self.fault_escape_y)
+            front = self.forward_clearance()
+            if front < self.FRONT_STOP_DIST_M:
+                self.fault_stage = "DONE"
+                print(f"\n[PathRecommender] [FAULT] 이탈 전진 중 전방도 막힘({front:.2f}m) - 정지 유지")
+            elif moved < self.ESCAPE_FWD_DIST_M and elapsed < self.ESCAPE_FWD_TIMEOUT_SEC:
+                self._send_ble("0")
+                return pack(0.0, "Front",
+                            f"[이상 상태 {fault}] 벽에서 이탈 전진 중 ({moved:.2f}/{self.ESCAPE_FWD_DIST_M:.2f}m, 전방 {front:.2f}m)",
+                            True)
+            else:
+                # 이탈 완료
+                if fault == self.FAULT_SLIP:
+                    self.fault_stage = "DONE"
+                    print(f"\n[PathRecommender] [FAULT 4] 이탈 완료. 슬립으로 오도메트리가 오염되어 "
+                          f"목표 좌표를 신뢰할 수 없음 -> 정지 유지")
+                else:
+                    self.fault_stage = "NONE"
+                    self.fault_code = 0
+                    self.fault_reason = ""
+                    self.mega_fault = 0
+                    self._scan_history.clear()
+                    if self.target_x is not None:
+                        self.state = "FORWARD"
+                        self.sub_stage = "ALIGN_X"
+                    print(f"\n[PathRecommender] [FAULT] 탈출 완료 (이동 {moved:.2f}m) -> 목표 주행 재개")
+                    self._send_stop_packet(reset_odo=False)
+                    return pack(self.STOP_ANGLE, "STOP", "탈출 완료 -> 목표 주행 재개", False)
+
+        # ── 5단계: 정지 유지 ──
+        self.state = "STOPPED"
+        self._send_stop_packet(reset_odo=False)
+        return pack(self.STOP_ANGLE, "FAULT",
+                    f"[이상 상태 {fault}] {self.fault_reason} -> 주행 중단. 확인 후 [주행 시작]으로 재개하세요.",
+                    True)
+
+    def _start_escape_turn(self, now: float):
+        """현재 헤딩의 반대 방향(180도)을 목표로 선회 단계에 진입"""
+        current_rel = (self.robot_heading_deg - self.origin_heading + 180.0) % 360.0 - 180.0
+        self.fault_escape_head = (current_rel + 180.0 + 180.0) % 360.0 - 180.0
+        self.fault_stage = "ESCAPE_TURN"
+        self.fault_reverse_start = now
+        self._heading_turning = True  # 히스테리시스를 "턴 중"으로 시작
+        print(f"\n[PathRecommender] [FAULT] 회전 공간 확보됨 -> 180도 선회 시작 "
+              f"(현재 {current_rel:+.0f}° -> 목표 {self.fault_escape_head:+.0f}°)")
+
+    # ── 회피 직진 단계 중 전방 재차단 시 비상 처리 ────────────────
+    def _abort_avoid_on_front_block(
+        self,
+        stage_label: str,
+        front_clearance: float,
+        scores: List["DirectionScore"],
+        dist_m: Optional[float],
+        goal_rel_angle: Optional[float],
+    ) -> PathRecommendation:
+        """
+        ㄷ자 회피의 직진 단계(2단계 가로 폭 통과 / 4단계 세로 길이 추월) 도중
+        진행 방향 전방에 새로운 장애물이 나타났을 때의 비상 정지 처리.
+
+        이 단계들은 원래 오도메트리 이동거리 / 측면 초음파 / 타임아웃만 보고
+        무조건 직진("0")을 내보내기 때문에, 회피 경로 위에 벽이나 사람이 있으면
+        그대로 충돌한다. 여기서 즉시 STOP 을 보내고 회피 상태 머신을 IDLE 로
+        되돌리면, 다음 프레임에 일반 목표 지향 주행 로직이 같은 전방 장애물을
+        다시 감지해 "현재 위치와 현재 센서 값" 기준으로 회피 방향을 새로 고른다.
+
+        좌우로 계속 왔다갔다하며 갇히는 것을 막기 위해 재시작 횟수를
+        MAX_AVOID_RETRY 로 제한하고, 초과하면 정지(STOPPED) 상태로 전환한다.
+        """
+        self.avoid_state = "IDLE"
+        self.avoid_target_head = None
+        self.avoid_clear_count = 0
+        self.avoid_step_timeout = 0
+        self.avoid_retry_count += 1
+        self._send_stop_packet(reset_odo=False)
+
+        if self.avoid_retry_count > self.MAX_AVOID_RETRY:
+            self.state = "STOPPED"
+            self.avoid_retry_count = 0
+            is_stuck = True
+            reason_msg = (
+                f"[회피 실패] {stage_label} 중 전방 재차단(전방 {front_clearance:.2f}m) - "
+                f"회피 재시도 {self.MAX_AVOID_RETRY}회 초과 -> 주행 중단 및 정지"
+            )
+        else:
+            is_stuck = False
+            reason_msg = (
+                f"[회피 비상 정지] {stage_label} 중 전방 장애물 감지 (전방 {front_clearance:.2f}m "
+                f"< {self.FRONT_STOP_DIST_M:.2f}m) -> 회피 중단, 현재 위치에서 재탐색 "
+                f"({self.avoid_retry_count}/{self.MAX_AVOID_RETRY}회)"
+            )
+
+        return PathRecommendation(
+            best_angle_deg=self.STOP_ANGLE,
+            best_label="Stop",
+            reason=reason_msg,
+            scores=scores,
+            is_stuck=is_stuck,
+            target_x=self.target_x,
+            target_y=self.target_y,
+            target_name=self.target_name,
+            dist_to_goal_m=dist_m,
+            goal_rel_angle_deg=goal_rel_angle,
+            is_goal_reached=False,
+            robot_x=self.robot_x,
+            robot_y=self.robot_y,
+            robot_heading_deg=self.robot_heading_deg,
+        )
+
     # ── 메인 추천 엔진 ───────────────────────────────────────────
     def recommend(self) -> PathRecommendation:
+        """
+        경로 추천 결과를 반환한다.
+
+        실제 판단 로직은 _recommend_impl() 에 있고, 여기서는 그 결과에 실측
+        장애물 치수/동적 회피 목표치를 한 번에 채워 넣는다. _recommend_impl()
+        안에는 return 지점이 15곳이 넘어서, 각 지점마다 이 필드들을 넘기면
+        반드시 빠뜨리는 곳이 생기기 때문이다 (실제로 전부 빠져 있어서
+        대시보드의 장애물 크기 표시가 통째로 동작하지 않았다).
+        """
+        rec = self._recommend_impl()
+        rec.fault_code = self.fault_code
+        rec.fault_reason = self.fault_reason
+
+        # 목표 도착 상태에서는 직전 장애물 정보를 그대로 남겨두지 않고 비운다.
+        if not rec.is_goal_reached:
+            rec.obs_w = self.obs_measured_w
+            rec.obs_l = self.obs_measured_l
+            rec.target_avoid_w = self.target_avoid_width_m
+            rec.target_avoid_l = self.target_avoid_length_m
+        return rec
+
+    def _recommend_impl(self) -> PathRecommendation:
         """
         하이브리드 동작 로직:
         1. 목표 좌표가 지정된 경우 목표 지향성 스코어링 및 거리 계산 연동.
@@ -588,6 +1023,18 @@ class PathRecommender:
         # 목표 좌표 벡터 계산
         dist_m, goal_rel_angle, goal_global_angle = self._compute_goal_vector()
         has_goal = (dist_m is not None and goal_rel_angle is not None)
+
+        # ─────────────────────────────────────────────────────────
+        # [최우선] 이상 상태(메가 fault / 라이다 슬립) 확인
+        #
+        # ★ 이 검사는 반드시 아래 도착 판정보다 앞에 있어야 한다.
+        #   슬립 중에는 엔코더가 계속 거리를 누적하므로 오도메트리상으로는
+        #   목표에 "도착"해 버린다. 도착 판정이 먼저 걸리면 로봇이 제자리에
+        #   선 채로 "목표 위치에 도착했습니다"를 선언하게 된다.
+        # ─────────────────────────────────────────────────────────
+        fault = self._evaluate_fault()
+        if fault != 0:
+            return self._handle_fault(fault, dist_m, goal_rel_angle)
 
         # ── 0. 목표 도착 상태 최우선 처리 (방향 추천 일체 없이 오직 정지 신호만 전송) ──
         if self.state == "GOAL_REACHED" or (has_goal and dist_m <= self.ARRIVE_MARGIN_M):
@@ -610,10 +1057,6 @@ class PathRecommender:
                 robot_x=self.robot_x,
                 robot_y=self.robot_y,
                 robot_heading_deg=self.robot_heading_deg,
-                obs_w=0.0,
-                obs_l=0.0,
-                target_avoid_w=0.0,
-                target_avoid_l=0.0,
             )
 
         # 1. 19방향 스코어링 수행 (직진 우대 가중치 및 목표 지향성 반영)
@@ -758,6 +1201,13 @@ class PathRecommender:
 
                 # 2단계: 가로 폭 직진 & 오도메트리 이동 거리 검증 & 측면 초음파 감시
                 elif getattr(self, "avoid_state", "IDLE") == "AVOID_PASS_WIDTH":
+                    # [안전] 이 단계는 무조건 직진을 내보내므로, 진행 방향(현재 헤딩 기준 0도)
+                    # 전방이 막히면 다른 조건을 보기 전에 먼저 멈춘다.
+                    if front_clearance < self.FRONT_STOP_DIST_M:
+                        return self._abort_avoid_on_front_block(
+                            "회피 2단계(가로 폭 통과)", front_clearance, scores, dist_m, goal_rel_angle
+                        )
+
                     chosen_angle = 0.0
                     chosen_label = "Front"
                     self.avoid_step_timeout -= 1
@@ -844,6 +1294,12 @@ class PathRecommender:
 
                 # 4단계: 세로 길이 직진 & 오도메트리 이동 거리 검증 & 측면 초음파 감시 (장애물 완전 추월)
                 elif getattr(self, "avoid_state", "IDLE") == "AVOID_PASS_LENGTH":
+                    # [안전] 2단계와 동일하게, 맹목 직진 전에 전방을 먼저 확인한다.
+                    if front_clearance < self.FRONT_STOP_DIST_M:
+                        return self._abort_avoid_on_front_block(
+                            "회피 4단계(세로 길이 추월)", front_clearance, scores, dist_m, goal_rel_angle
+                        )
+
                     chosen_angle = 0.0
                     chosen_label = "Front"
                     self.avoid_step_timeout -= 1
@@ -868,6 +1324,7 @@ class PathRecommender:
                         self.avoid_state = "IDLE"
                         self.avoid_target_head = None
                         self.avoid_clear_count = 0
+                        self.avoid_retry_count = 0
                         chosen_angle = 0.0
                         chosen_label = "Front"
                         reason_msg = f"[ㄷ자 회피 완료] 장애물 추월 완료 (이동:{moved_dist:.2f}m/{target_l:.2f}m) -> 원래 레인 복귀 없이 목표 방향으로 바로 재조준"

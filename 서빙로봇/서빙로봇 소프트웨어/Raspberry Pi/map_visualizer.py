@@ -526,21 +526,39 @@ class MapVisualizer:
 
         # [2D 맵 전방 장애물 바운딩 박스 & 치수 태그 렌더링]
         if getattr(rec, "obs_w", 0.0) > 0.05:
-            # 로봇 전방 장애물 영역 박스 좌표 계산 (로봇 중심 기준)
+            # obs_w/obs_l 은 OccupancyMap.get_front_obstacle_dimensions() 가 돌려주는
+            # "로봇 로컬 프레임"(x=로봇 우측, y=로봇 전방) 기준 치수다. 반면 맵 격자는
+            # 회전하지 않는 월드 프레임이라, 축 정렬 사각형으로 그리면 로봇이 90도
+            # 돌아 있을 때 엉뚱한 방향에 박스가 그려진다. 네 꼭짓점을 로컬에서 만든 뒤
+            # 헤딩만큼 회전시켜 월드 좌표로 옮긴다.
+            # (mapper.get_front_obstacle_dimensions() 의 역회전과 정확히 반대 변환)
             half_w = rec.obs_w / 2.0
             y_front_min = 0.15
             y_front_max = y_front_min + max(0.20, rec.obs_l)
 
-            r_top, c_left  = self.occ_map.world_to_cell(-half_w, y_front_max)
-            r_bot, c_right = self.occ_map.world_to_cell(half_w, y_front_min)
+            h = math.radians(rec.robot_heading_deg)
+            cos_h, sin_h = math.cos(h), math.sin(h)
 
-            bx1 = offset_x + int(min(c_left, c_right) * px)
-            by1 = offset_y + int(min(r_top, r_bot) * px)
-            bx2 = offset_x + int(max(c_left, c_right) * px + px)
-            by2 = offset_y + int(max(r_top, r_bot) * px + px)
+            corners_px = []
+            for x_local, y_local in (
+                (-half_w, y_front_min), (half_w, y_front_min),
+                (half_w, y_front_max), (-half_w, y_front_max),
+            ):
+                x_world = x_local * cos_h + y_local * sin_h
+                y_world = -x_local * sin_h + y_local * cos_h
+                r_c, c_c = self.occ_map.world_to_cell(x_world, y_world)
+                corners_px.append([
+                    offset_x + int(c_c * px + px / 2),
+                    offset_y + int(r_c * px + px / 2),
+                ])
 
-            # 형광 오렌지 네온 바운딩 박스
-            cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (30, 140, 255), 2, cv2.LINE_AA)
+            # 형광 오렌지 네온 바운딩 박스 (로봇 헤딩을 따라 회전)
+            cv2.polylines(canvas, [np.array(corners_px, np.int32)], True,
+                          (30, 140, 255), 2, cv2.LINE_AA)
+
+            # 치수 태그는 회전된 박스의 좌상단 픽셀 기준으로 붙인다
+            bx1 = min(p[0] for p in corners_px)
+            by1 = min(p[1] for p in corners_px)
             cv2.rectangle(canvas, (bx1, max(0, by1 - 22)), (bx1 + 175, by1), (20, 26, 36), -1)
             cv2.rectangle(canvas, (bx1, max(0, by1 - 22)), (bx1 + 175, by1), (30, 140, 255), 1)
             obs_tag = f"Obs: W{rec.obs_w:.2f}m x L{rec.obs_l:.2f}m"

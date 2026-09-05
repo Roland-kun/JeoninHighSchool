@@ -31,6 +31,9 @@ bool bleAvailable = false;
 float robotX = 0.0;
 float robotY = 0.0;
 float robotYaw = 0.0;
+// 메가가 POS: 3번째 필드로 알려주는 이상 상태 코드
+// 0=정상 1=모터스톨 2=헤딩보정포화 3=바퀴편차
+int robotFault = 0;
 
 // BLE 설정
 BLEService myService("12345678-1234-1234-1234-1234567890ab");
@@ -183,9 +186,11 @@ void sendCombinedData() {
   if (bleAvailable) {
     BLEDevice central = BLE.central();
     if (central && central.connected()) {
+      // 6번째 필드 = 이상 상태 코드.
+      // PC 파서는 len(nums) >= 5 로 앞 5개만 쓰므로 구버전 PC 와도 깨지지 않는다.
       String msg = String(robotX, 3) + "," + String(robotY, 3) + "," +
                    String(yaw, 1) + "," + String(ch1, 1) + "," +
-                   String(ch2, 1) + "\n";
+                   String(ch2, 1) + "," + String(robotFault) + "\n";
       myChar.writeValue(msg);
     }
   }
@@ -204,6 +209,9 @@ void readMegaSerial() {
         if (inputBuffer.startsWith("POS:")) {
           int comma1 = inputBuffer.indexOf(',', 4);
           if (comma1 != -1) {
+            // 3번째 필드(이상 상태 코드)는 있을 수도, 없을 수도 있다.
+            // toFloat() 은 쉼표에서 멈추므로 tempY 파싱은 양쪽 포맷 다 안전하다.
+            int comma2 = inputBuffer.indexOf(',', comma1 + 1);
             float tempX = inputBuffer.substring(4, comma1).toFloat();
             float tempY = inputBuffer.substring(comma1 + 1).toFloat();
 
@@ -211,6 +219,14 @@ void readMegaSerial() {
                 !isinf(tempY)) {
               robotX = tempX;
               robotY = tempY;
+              if (comma2 != -1) {
+                int f = inputBuffer.substring(comma2 + 1).toInt();
+                if (f != robotFault) {
+                  Serial.print("[FAULT] 메가 이상 상태 코드: ");
+                  Serial.println(f);
+                }
+                robotFault = f;
+              }
               sendCombinedData();
             }
           }

@@ -274,12 +274,28 @@ def main(use_mock: bool = False, visualize: bool = True):
             if classified_objects:
                 _update_map_from_classified(occ_map, classified_objects)
 
+            # 슬립 감지용으로 최신 라이다 스캔 공급 (오도메트리와 대조할 유일한 독립 관측)
+            recommender.feed_lidar_scan(lidar_scan)
+
             # 경로 추천 및 로봇 이동 시뮬레이션
             recommendation = recommender.recommend()
 
             # [음성 안내] 장애물 회피 상태 진입 감지
             if recommender.avoid_state in ("AVOID_BRAKE", "AVOID_TURN_90"):
                 voice_mgr.say("전방 장애물을 감지하여 우회 주행합니다.", cooldown_sec=6.0)
+
+            # [이상 상태] 메가 fault 또는 라이다 슬립 감지 -> 주행 중단 + 음성 안내
+            if recommendation and getattr(recommendation, "fault_code", 0) != 0:
+                if is_driving:
+                    is_driving = False
+                    status_msg = f"FAULT {recommendation.fault_code}: DRIVE ABORTED"
+                    print(f"[UI] ⚠️ 이상 상태 감지 -> 주행 중단: {recommendation.fault_reason}")
+                if recommendation.fault_code == 4:
+                    voice_mgr.say("바퀴가 헛돌고 있습니다. 주행을 중단합니다. 확인이 필요합니다.",
+                                  priority=True, cooldown_sec=10.0)
+                else:
+                    voice_mgr.say("주행에 문제가 발생했습니다. 확인이 필요합니다.",
+                                  priority=True, cooldown_sec=10.0)
 
             # 목표 도착 체크
             if is_driving and recommendation and recommendation.is_goal_reached:
