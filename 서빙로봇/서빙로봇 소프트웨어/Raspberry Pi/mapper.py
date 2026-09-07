@@ -63,8 +63,38 @@ class OccupancyMap:
         self.hit_count      = np.zeros_like(self.grid, dtype=np.int32)    # 장애물 감지 카운트
         self.free_count     = np.zeros_like(self.grid, dtype=np.int32)    # 빈 공간 감지 카운트
         self.last_hit_time  = np.zeros_like(self.grid, dtype=np.float64)  # 장애물이 마지막으로 감지된 시간 (s)
+        self.first_hit_time = np.zeros_like(self.grid, dtype=np.float64)  # 현재 관측 구간이 시작된 시간 (s)
+        # 사람으로 분류된 셀 등, 이 시각까지는 영구 지도로 승격시키지 않는다
+        self.no_promote_until = np.zeros_like(self.grid, dtype=np.float64)
+        # 이 셀을 마지막으로 OAK 화각 안에서 장애물로 관측한 시각 (s)
+        self.oak_seen_time    = np.zeros_like(self.grid, dtype=np.float64)
         self.OBSTACLE_MEMORY_SEC = 5.0  # 장애물 메모리 보존 시간 (5초 동안 책상 상판을 라이다가 지우지 못하도록 보호)
-        self.STATIC_PROMOTE_HIT_COUNT = 8  # 이 횟수를 초과해 일관되게 감지되면 static_grid(영구 지도)에 편입
+
+        # [영구 승격 기준]
+        # 이전 값(8회)은 실측상 사람이 0.2초만 서 있어도 통과했다. 원인은 두 가지였다.
+        #  - get_scan() 이 새 스캔이 없으면 캐시된 직전 스캔을 그대로 반환해 같은 관측이
+        #    프레임마다 중복 계수됨 (라이다 5.5Hz vs 루프 15FPS -> 약 2.7배)
+        #  - 한 스캔 안에서 여러 광선이 같은 셀을 때려 스캔 1회에 +3 씩 오름
+        # 아래 update_from_lidar 에서 두 중복을 모두 제거했고, 그 위에 기준을 세웠다.
+        self.STATIC_PROMOTE_HIT_COUNT = 25  # 중복 제거 기준 약 25회 (5.5Hz 에서 약 4.5초)
+        self.STATIC_PROMOTE_MIN_SEC = 3.0   # 관측 시작~최근 관측이 이 시간 이상 벌어져야 함
+        # 사람으로 분류된 셀의 hit_count 상한. 장애물 메모리 유지에 필요한 최소값(2)의
+        # 두 배로 두어, 회피는 정상 동작하되 승격 조건(hit > 25)에는 못 닿게 한다.
+        self.PERSON_HIT_CAP = 4
+
+        # [승격 자격] 분류기가 검증할 수 있는 방위에서 본 관측인가
+        # 위 PERSON_HIT_CAP 은 block_promotion() 이 불려야 걸리고, 그건 분류기가
+        # PERSON 라벨을 붙여줘야 열린다. 그런데 PERSON 은 OAK 융합 분류에서만
+        # 나온다 - object_classifier 는 lidar_only 클러스터를 무조건 OBSTACLE 로
+        # 내린다. 라이다는 ±90도를 보는데 OAK 는 ±36.5도뿐이라, 그 바깥 측면에 선
+        # 사람은 구조적으로 PERSON 이 될 수 없고 캡도 안 걸린다.
+        # (실측: 측면 60도에 10초 서 있으면 5초 만에 영구 지도에 벽으로 박혔다)
+        # 그래서 OAK 화각 밖에서만 본 셀은 "검증받지 못한 관측"으로 보고 시간 조건을
+        # 훨씬 길게 요구한다. 사람은 버티기 어렵고 벽은 버티는 길이다.
+        # 측면을 아예 막지 않는 이유: 로봇이 나란히 지나가는 복도 벽은 끝까지 정면에
+        # 안 들어오므로, 완전히 막으면 영구 지도에 정면으로 마주친 것만 남는다.
+        self.OAK_VERIFY_HALF_FOV_DEG = getattr(config, "OAK_HFOV_DEG", 73.0) / 2.0
+        self.STATIC_PROMOTE_SIDE_MIN_SEC = 15.0
 
         # 로봇 현재 위치 (맵 중앙에서 시작하며, set_robot_pose 호출 시 실제 이동을 따라 갱신됨)
         self.robot_col = self.width_cells  // 2
@@ -81,6 +111,8 @@ class OccupancyMap:
 
         # 마지막 업데이트 시간
         self.last_update = time.time()
+        # 직전에 반영한 스캔의 타임스탬프 (같은 스캔의 중복 반영을 막는다)
+        self._last_scan_ts = None
 
     # ── 로봇 자세(오도메트리) 반영 ────────────────────────────────
     def set_robot_pose(self, x_fwd_m: float, y_left_m: float, heading_deg: float):
@@ -97,6 +129,46 @@ class OccupancyMap:
         # 고정 원점 셀로부터의 변위로 현재 로봇 셀 위치를 갱신
         self.robot_col = self._origin_col + int(round(self.robot_world_x / self.resolution))
         self.robot_row = self._origin_row - int(round(self.robot_world_y / self.resolution))
+
+    # ── 장애물 관측 1회 등록 ──────────────────────────────────────
+    def _register_hit(self, row: int, col: int, now: float, weight: int = 1):
+        """
+        장애물 감지를 기록하고, 관측 구간의 시작 시각(first_hit_time)을 관리한다.
+        관측이 OBSTACLE_MEMORY_SEC 이상 끊겼다가 다시 시작되면 새 구간으로 본다
+        (오래 전 잠깐 스쳤던 기록이 시간 폭 조건을 거저 통과하지 못하도록).
+        """
+        prev = self.last_hit_time[row, col]
+        if prev == 0.0 or (now - prev) > self.OBSTACLE_MEMORY_SEC:
+            self.first_hit_time[row, col] = now
+        self.hit_count[row, col] += weight
+        self.last_hit_time[row, col] = now
+
+    def block_promotion(self, row: int, col: int, now: float,
+                        radius_cells: int = 3, sec: float = 10.0):
+        """
+        이 셀 주변을 사람으로 간주해 영구 지도(static_grid) 승격에서 제외한다.
+
+        ★ 승격 차단 표시만으로는 부족하다.
+          hit_count 는 어디서도 줄지 않으므로, 사람이 4초만 서 있어도 수백까지
+          쌓인다. 그 상태로 사람이 떠나면 5초간은 장애물 메모리가 free 광선을
+          막아 free_count 도 안 오르고, no_promote_until 이 만료되는 순간
+          hit/total 이 여전히 0.6~0.9 라 그대로 승격돼 버린다.
+          (실측: 4초 서 있으면 14초에, 20초 서 있으면 30초에 유령 벽 발생)
+          결국 차단이 아니라 sec 초 지연에 불과했다.
+
+          그래서 hit_count 자체에 상한을 건다. 5초 장애물 메모리와 prepare_frame
+          보호는 hit >= 2 만 요구하므로(PERSON_HIT_CAP = 4 는 그 두 배),
+          회피 대상으로는 그대로 잡히면서 승격 조건(hit > 25)에는 도달할 수 없다.
+          사람이 떠나면 free 광선 몇 번에 비율이 무너져 자연 소멸한다.
+        """
+        until = now + sec
+        for dr in range(-radius_cells, radius_cells + 1):
+            for dc in range(-radius_cells, radius_cells + 1):
+                r, c = row + dr, col + dc
+                if self.in_bounds(r, c):
+                    self.no_promote_until[r, c] = until
+                    if self.hit_count[r, c] > self.PERSON_HIT_CAP:
+                        self.hit_count[r, c] = self.PERSON_HIT_CAP
 
     # ── 좌표 변환 ─────────────────────────────────────────────────
     # 월드 좌표(미터)를 맵 셀 인덱스로 변환하는 메서드
@@ -131,8 +203,23 @@ class OccupancyMap:
         if scan is None or not scan.points:  # 스캔 데이터가 없으면
             return 0  # 업데이트 없음
 
+        # [중복 스캔 차단] LidarProcessor.get_scan() 은 새 스캔이 없으면 캐시된 직전
+        # 스캔을 그대로 반환한다. 라이다는 약 5.5Hz 인데 메인 루프는 15FPS 라, 그대로
+        # 두면 같은 관측이 약 2.7배 중복 계수되어 신뢰도 카운트가 부풀려진다.
+        scan_ts = getattr(scan, "timestamp", None)
+        if scan_ts is not None and scan_ts == self._last_scan_ts:
+            return 0
+        self._last_scan_ts = scan_ts
+
         now = time.time()
-        updated = 0  # 업데이트된 셀 수
+
+        # [셀 중복 제거] 한 스캔 안에서 여러 광선이 같은 셀을 때리면(사람 폭이 8도만
+        # 돼도 광선 17개가 5cm 셀 하나에 수렴) 스캔 1회에 카운트가 +3씩 올랐다.
+        # 스캔 1회당 셀 1회로 정규화한다.
+        hit_cells = set()
+        free_cells = set()
+        verified_cells = set()  # 그 중 OAK 화각 안에서 본 끝점 (분류기가 걸러줄 수 있는 셀)
+
         for point in scan.points:  # 각 포인트에 대해
             if point.distance_m <= 0:  # 거리가 유효하지 않으면
                 continue  # 건너뜀
@@ -152,19 +239,34 @@ class OccupancyMap:
             )
             for r, c in ray_cells[:-1]:  # 끝점 제외한 경로 셀들
                 if self.in_bounds(r, c):  # 맵 범위 내이면
-                    # [장애물 메모리 보호] 최근 5초 이내에 감지된 장애물 셀은 라이다 빈 공간 광선이 지우지 못하도록 보호!
-                    if (now - self.last_hit_time[r, c] < self.OBSTACLE_MEMORY_SEC) and (self.grid[r, c] >= CELL_WALL):
-                        continue
+                    free_cells.add((r, c))
 
-                    self.free_count[r, c] += 1  # 빈 공간 카운트 증가
-                    self._update_cell(r, c, now)  # 셀 상태 업데이트
-
-            # 끝점은 장애물로 마킹
             if self.in_bounds(end_row, end_col):  # 범위 내이면
-                self.hit_count[end_row, end_col] += 1  # 장애물 카운트 증가
-                self.last_hit_time[end_row, end_col] = now  # 마지막 감지 타임스탬프 갱신
-                self._update_cell(end_row, end_col, now)  # 셀 상태 업데이트
-                updated += 1  # 업데이트 수 증가
+                hit_cells.add((end_row, end_col))
+                # OAK 화각 안의 끝점만 분류기가 사람/벽을 판별해줄 수 있다
+                if abs(point.angle_deg) <= self.OAK_VERIFY_HALF_FOV_DEG:
+                    verified_cells.add((end_row, end_col))
+
+        # 같은 스캔에서 끝점이기도 한 셀은 빈 공간으로 치지 않는다 (끝점 우선)
+        free_cells -= hit_cells
+
+        for r, c in free_cells:
+            # [장애물 메모리 보호] 최근 5초 이내에 감지된 장애물 셀은 라이다 빈 공간 광선이 지우지 못하도록 보호!
+            if (now - self.last_hit_time[r, c] < self.OBSTACLE_MEMORY_SEC) and (self.grid[r, c] >= CELL_WALL):
+                continue
+            self.free_count[r, c] += 1  # 빈 공간 카운트 증가
+            self._update_cell(r, c, now)  # 셀 상태 업데이트
+
+        # 승격 자격 판정에 쓰이므로 _update_cell 보다 먼저 찍는다
+        for r, c in verified_cells:
+            self.oak_seen_time[r, c] = now
+
+        # 끝점은 장애물로 마킹
+        updated = 0  # 업데이트된 셀 수
+        for r, c in hit_cells:
+            self._register_hit(r, c, now)  # 장애물 카운트 + 관측 구간 시작 시각 관리
+            self._update_cell(r, c, now)   # 셀 상태 업데이트
+            updated += 1  # 업데이트 수 증가
 
         # 마지막 업데이트 시간 기록
         self.last_update = now
@@ -197,9 +299,9 @@ class OccupancyMap:
             if self.in_bounds(end_row, end_col):  # 범위 내이면
                 # 신뢰도에 따라 가중치 적용
                 weight = int(obs.confidence * 4) + 2
-                self.hit_count[end_row, end_col] += weight  # 가중치만큼 장애물 카운트 증가
+                self._register_hit(end_row, end_col, now, weight)  # 카운트 + 관측 구간 시작 시각
+                self.oak_seen_time[end_row, end_col] = now  # OAK 가 직접 본 셀 (검증 가능)
                 self.free_count[end_row, end_col] = 0       # 기존 free 카운트 리셋 (확실한 장애물 선언)
-                self.last_hit_time[end_row, end_col] = now  # 5초 메모리 보호 타임스탬프 갱신
                 self.grid[end_row, end_col] = CELL_OBSTACLE # 즉시 장애물 부여
 
                 # [책상 상판 두께 팽창] 장애물 주변 3x3 반경도 함께 메모리 보호 등록
@@ -207,8 +309,8 @@ class OccupancyMap:
                     for dc in [-1, 0, 1]:
                         nr, nc = end_row + dr, end_col + dc
                         if self.in_bounds(nr, nc):
-                            self.last_hit_time[nr, nc] = now
-                            self.hit_count[nr, nc] += 1
+                            self._register_hit(nr, nc, now)
+                            self.oak_seen_time[nr, nc] = now
                             self._update_cell(nr, nc, now)
 
                 updated += 1  # 업데이트 수 증가
@@ -231,7 +333,18 @@ class OccupancyMap:
         # 이후엔 센서 시야를 벗어나거나 다음 세션에 다시 켜도 계속 기억된다.
         # (사람처럼 움직이는 대상은 한 셀에서 hit_count가 이 정도까지 쌓이기 전에 자리를 벗어나므로
         #  자연히 승격되지 않는다.)
-        if hit > self.STATIC_PROMOTE_HIT_COUNT and total > 0 and (hit / total) > 0.40:
+        # 관측이 얼마나 긴 시간에 걸쳐 일관됐는지 (카운트만으로는 프레임률에 좌우된다)
+        observed_span = self.last_hit_time[row, col] - self.first_hit_time[row, col]
+        # 이번 관측 구간 안에 OAK 화각 관측이 섞여 있으면 분류기가 사람 여부를 걸러줄
+        # 수 있다 -> 정상 기준. 측면에서만 본 셀은 그 검증을 못 받았으므로 사람이
+        # 버티기 어려운 길이(STATIC_PROMOTE_SIDE_MIN_SEC)를 요구한다.
+        oak_verified = (now - self.oak_seen_time[row, col]) <= self.OBSTACLE_MEMORY_SEC
+        min_span = (self.STATIC_PROMOTE_MIN_SEC if oak_verified
+                    else self.STATIC_PROMOTE_SIDE_MIN_SEC)
+        if (hit > self.STATIC_PROMOTE_HIT_COUNT
+                and total > 0 and (hit / total) > 0.40
+                and observed_span >= min_span
+                and now >= self.no_promote_until[row, col]):
             self.static_grid[row, col] = CELL_WALL
             self.grid[row, col] = CELL_WALL
             return
@@ -404,8 +517,16 @@ class OccupancyMap:
                 robot_row=self.robot_row,
                 timestamp=time.time(),
             )
-            # 사람이 열어볼 수 있는 PNG 이미지로도 함께 저장
-            img_path = filepath.rsplit(".", 1)[0] + ".png"
+        except Exception as e:
+            print(f"[OccupancyMap] ❌ 맵 저장 실패: {e}")
+            return False
+
+        # 사람이 열어볼 수 있는 PNG 이미지로도 함께 저장.
+        # ★ 별도 try 로 분리한다. 실제 지도 데이터는 위 .npz 로 이미 저장이 끝났으므로,
+        #   PNG 쓰기(cv2)가 실패했다고 저장 자체를 실패로 보고하면 안 된다.
+        #   (cv2 미설치 환경에서 .npz 는 멀쩡히 저장됐는데 False 를 반환하던 문제)
+        img_path = filepath.rsplit(".", 1)[0] + ".png"
+        try:
             norm_map = np.full(self.static_grid.shape, 128, dtype=np.uint8) # 기본 미지: 128
             norm_map[self.static_grid == CELL_FREE] = 230      # 빈 공간: 밝은 흰색/회색
             norm_map[self.static_grid == CELL_WALL] = 80       # 벽: 진한 회색
@@ -414,10 +535,9 @@ class OccupancyMap:
             import cv2
             cv2.imwrite(img_path, norm_map)
             print(f"[OccupancyMap] 💾 맵 저장 완료: {filepath} & {img_path}")
-            return True
         except Exception as e:
-            print(f"[OccupancyMap] ❌ 맵 저장 실패: {e}")
-            return False
+            print(f"[OccupancyMap] 💾 맵 저장 완료: {filepath} (PNG 미리보기는 건너뜀: {e})")
+        return True
 
     def load_map(self, filepath: str = "saved_map.npz") -> bool:
         """저장된 .npz 맵 파일을 불러와 현재 맵 및 static_grid로 복원"""
@@ -437,7 +557,9 @@ class OccupancyMap:
                     self.hit_count[:] = data["hit_count"]
                 if "free_count" in data:
                     self.free_count[:] = data["free_count"]
-                self.last_hit_time[:] = time.time()  # 메모리 보호 시간 갱신
+                loaded_now = time.time()
+                self.last_hit_time[:] = loaded_now   # 메모리 보호 시간 갱신
+                self.first_hit_time[:] = loaded_now  # 불러온 셀이 시간 폭 조건을 거저 통과하지 않도록
                 print(f"[OccupancyMap] 📂 맵 불러오기 성공: {filepath} (크기: {self.grid.shape})")
                 return True
             else:
@@ -465,3 +587,7 @@ class OccupancyMap:
         self.hit_count[:]     = 0             # 히트 카운트 초기화
         self.free_count[:]    = 0             # 프리 카운트 초기화
         self.last_hit_time[:] = 0.0           # 장애물 메모리 초기화
+        self.first_hit_time[:] = 0.0          # 관측 구간 시작 시각 초기화
+        self.no_promote_until[:] = 0.0        # 승격 차단 표시 초기화
+        self.oak_seen_time[:] = 0.0           # OAK 검증 관측 시각 초기화
+        self._last_scan_ts = None             # 중복 스캔 판별 상태 초기화

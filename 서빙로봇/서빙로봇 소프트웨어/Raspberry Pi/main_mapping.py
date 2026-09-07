@@ -284,17 +284,26 @@ def main(use_mock: bool = False, visualize: bool = True):
             if recommender.avoid_state in ("AVOID_BRAKE", "AVOID_TURN_90"):
                 voice_mgr.say("전방 장애물을 감지하여 우회 주행합니다.", cooldown_sec=6.0)
 
-            # [이상 상태] 메가 fault 또는 라이다 슬립 감지 -> 주행 중단 + 음성 안내
+            # [이상 상태] 메가 fault 또는 라이다 슬립 감지
+            # best_label 이 "FAULT" 면 자력 탈출이 끝났거나 불가능한 최종 상태이고,
+            # 그 전(REVERSE / 선회 / 이탈 전진)은 아직 탈출 시도 중이다.
+            # ★ 탈출 시도 중에 is_driving 을 내리면, 탈출에 성공해 주행을 재개해도
+            #   is_driving 이 False 로 남아 아래 도착 판정이 영영 동작하지 않는다.
             if recommendation and getattr(recommendation, "fault_code", 0) != 0:
-                if is_driving:
-                    is_driving = False
+                if recommendation.best_label == "FAULT":
+                    if is_driving:
+                        is_driving = False
+                        print(f"[UI] ⚠️ 이상 상태 -> 주행 중단: {recommendation.fault_reason}")
                     status_msg = f"FAULT {recommendation.fault_code}: DRIVE ABORTED"
-                    print(f"[UI] ⚠️ 이상 상태 감지 -> 주행 중단: {recommendation.fault_reason}")
-                if recommendation.fault_code == 4:
-                    voice_mgr.say("바퀴가 헛돌고 있습니다. 주행을 중단합니다. 확인이 필요합니다.",
-                                  priority=True, cooldown_sec=10.0)
+                    if recommendation.fault_code == 4:
+                        voice_mgr.say("바퀴가 헛돌고 있습니다. 주행을 중단합니다. 확인이 필요합니다.",
+                                      priority=True, cooldown_sec=10.0)
+                    else:
+                        voice_mgr.say("주행에 문제가 발생했습니다. 확인이 필요합니다.",
+                                      priority=True, cooldown_sec=10.0)
                 else:
-                    voice_mgr.say("주행에 문제가 발생했습니다. 확인이 필요합니다.",
+                    status_msg = f"FAULT {recommendation.fault_code}: RECOVERING..."
+                    voice_mgr.say("장애물에 걸렸습니다. 빠져나가는 중입니다.",
                                   priority=True, cooldown_sec=10.0)
 
             # 목표 도착 체크
@@ -438,14 +447,36 @@ def main(use_mock: bool = False, visualize: bool = True):
 
 
 def _update_map_from_classified(occ_map: OccupancyMap, classified_objects: List[ClassifiedObject]): 
+    """
+    분류기 결과를 맵에 반영한다.
+
+    ★ PERSON 은 다른 타입과 다르게 처리한다.
+      원시 라이다(update_from_lidar)는 사람인지 벽인지 모르고 끝점 셀의 hit_count 를
+      계속 올리며, 그 카운트가 static_grid(영구 지도, saved_map.npz 로 저장되는 것)로의
+      승격을 결정한다. 그래서 분류기가 "사람"이라고 이미 알고 있는데도 바로 옆에서
+      그 셀이 영구 지도에 박히는 일이 벌어진다.
+      여기서 block_promotion() 으로 승격을 막고 hit_count 에 상한(PERSON_HIT_CAP)을
+      건다. 상한을 거는 이유는 mapper.block_promotion() 주석 참고 - 차단 표시만으로는
+      승격이 막히는 게 아니라 지연될 뿐이었다. 상한값은 5초 장애물 메모리가 요구하는
+      최소값(2)보다 크므로 회피 대상으로는 계속 잡히고, 자리를 뜨면 자연히 사라진다.
+    """
+    now = time.time()
     for obj in classified_objects:
         if obj.object_type in (ObjectType.PERSON, ObjectType.OBSTACLE, ObjectType.GLASS_WALL):
             rad = math.radians(obj.angle_deg + occ_map.robot_heading_deg)
             x_m = obj.distance_m * math.sin(rad)
             y_m = obj.distance_m * math.cos(rad)
             row, col = occ_map.world_to_cell(x_m, y_m)
-            val = 0.6 if obj.object_type == ObjectType.GLASS_WALL else 1.0
-            occ_map.set_cell(row, col, val)
+
+            if obj.object_type == ObjectType.PERSON:
+                # 사람 폭(기본 0.4m)만큼 주변 셀까지 승격을 막는다
+                width_m = obj.width_m if obj.width_m and obj.width_m > 0.0 else 0.40
+                radius_cells = max(3, int(math.ceil((width_m / 2.0) / occ_map.resolution)))
+                occ_map.block_promotion(row, col, now, radius_cells=radius_cells)
+                occ_map.set_cell(row, col, 1.0)
+            else:
+                val = 0.6 if obj.object_type == ObjectType.GLASS_WALL else 1.0
+                occ_map.set_cell(row, col, val)
 
 
 if __name__ == "__main__":

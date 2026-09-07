@@ -121,6 +121,12 @@ const unsigned long REVERSE_MAX_MS = 1500;
 bool isReversing = false;
 unsigned long reverseStartTime = 0;
 float reverseStartX = 0.0, reverseStartY = 0.0;
+// ★ 후진 종료 직후의 재시작 방지.
+// PC 는 REVERSE 를 400ms 하트비트로 계속 보내는데, 메가가 1.5초에 자체 종료하면
+// 곧바로 도착하는 다음 하트비트가 새 후진을 시작시켜 의도의 2배(최대 50cm)를
+// 물러나게 된다. 후방에 센서가 하나도 없으므로 거리는 메가가 못박아야 한다.
+unsigned long reverseCooldownUntil = 0;
+const unsigned long REVERSE_COOLDOWN_MS = 2500;
 
 // 세 값의 중앙값 (바퀴 편차 판정용)
 float medianOf3(float a, float b, float c) {
@@ -562,7 +568,7 @@ void processCommand(String cmd, uint32_t now) {
         lastRecvTime = now;
         // 직진과 다른 동작이므로 fault 래치를 해제하고 실행한다 (상위의 탈출 시도)
         faultCode = FAULT_NONE;
-        if (!isReversing) {
+        if (!isReversing && now >= reverseCooldownUntil) {
           isTurning = false;
           initStraightMode(-1);
           isReversing = true;
@@ -651,7 +657,7 @@ void processCommand(String cmd, uint32_t now) {
   } else if (cmd.equalsIgnoreCase("REVERSE")) {
     lastRecvTime = now;
     faultCode = FAULT_NONE;
-    if (!isReversing) {
+    if (!isReversing && now >= reverseCooldownUntil) {
       isTurning = false;
       initStraightMode(-1);
       isReversing = true;
@@ -1199,6 +1205,7 @@ void loop() {
       if (byDist || byTime) {
         STOP();
         isReversing = false;
+        reverseCooldownUntil = now + REVERSE_COOLDOWN_MS; // 하트비트로 인한 재시작 차단
         driveDir = 0;
         currentBasePWM = 0;
         pwmA = pwmB = pwmC = pwmD = 0;
