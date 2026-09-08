@@ -61,7 +61,9 @@ float headingIntegral = 0.0;
 // 엔코더 카운트율 단위가 아니다. 실측 속도가 목표에 얼마나 못 미치는지 확인하기 위한
 // 관측 전용 코드로, 주행 동작에는 전혀 영향을 주지 않는다.
 // 진단이 끝나면 0 으로 바꾸면 컴파일에서 통째로 빠진다.
-#define HEADING_SPEED_TRACE 1
+// 실측 완료(2026-09-08): 정속 평균 80.5, 최소 48.5 -> 스톨 임계 확정.
+// 필요하면 1 로 되돌려 다시 관측할 수 있다.
+#define HEADING_SPEED_TRACE 0
 
 #if HEADING_SPEED_TRACE
 float traceTargetLeft = 0.0;   // 직전 제어 주기의 좌측 목표 속도
@@ -78,16 +80,30 @@ float traceTargetRight = 0.0;  // 직전 제어 주기의 우측 목표 속도
 #define FAULT_WHEEL 3   // 한 바퀴만 나머지와 따로 놂 (들림/걸림). 출력 상향은 무의미
 
 // 감지 임계값.
-// ★ STALL_SPEED_THRESH 는 정상 주행 속도(엔코더 counts/100ms)에 의존한다.
-//   오도메트리 역산 추정치가 62~84 이라 그 20% 인 15 를 잠정값으로 둔다.
-//   [SPD] 트레이스로 실측한 뒤 반드시 보정할 것.
-const int STALL_SPEED_THRESH = 15;
-const int STALL_MIN_BASE_PWM = 60;    // 실제로 밀고 있을 때만 스톨로 본다
+// ─────────────────────────────────────────────────────────────────────
+// [SPD] 트레이스 실측 결과로 확정 (전진 48샘플 / 후진 39샘플, base 125 정속 79샘플):
+//   정속 4바퀴 평균속도 : 최소 48.5 / 5%분위 69.0 / 중앙 82.0
+//   램프 구간          : base 60 -> 0.0,  base 80 -> 15.8~25.2,
+//                        base 100 -> 24.5, base 120 -> 26.5~52.2
+//   바퀴/중앙값 비율    : 0.84 ~ 1.13
+//   헤딩 |오차| 최대    : 3.2도, 보정 포화 0/79회
+// ─────────────────────────────────────────────────────────────────────
+
+// 정속 실측 최솟값 48.5 의 41%. 잠정값 15 보다 조금 올려서, 뭔가를 밀며 겨우
+// 기어가는 "부분 스톨"(속도 18 같은 상태)도 잡히게 한다. 여유는 여전히 2.4배.
+const int STALL_SPEED_THRESH = 20;
+
+// ★ 잠정값 60 에서 상향. 실측상 base 80 의 속도가 15.8~25.2 로, 옛 임계 15 와
+//   겨우 1.05배 차이였다. 자율 주행은 항상 base 125 라 FAULT_GRACE_MS 로 램프가
+//   걸러지지만, PS2 아날로그로 천천히 몰면 base 가 60~100 에 계속 머물러 유예
+//   시간이 지난 뒤 오검출로 이어진다 (부스트 사다리가 출력을 PWM_PROTECT 로
+//   묶어 수동 조작이 먹통이 된다). 정속 구간에서만 판정하도록 올린다.
+const int STALL_MIN_BASE_PWM = 110;
 const uint8_t STALL_TICKS = 5;        // 0.5초 연속
-const float HEADING_FAULT_DEG = 8.0;  // 정상 주행 실측 최대 오차 2.3도 대비 충분한 여유
+const float HEADING_FAULT_DEG = 8.0;  // 실측 최대 오차 3.2도 대비 2.5배 여유 (+ 포화 AND 조건)
 const uint8_t HEADING_TICKS = 10;     // 1.0초 연속
-const float WHEEL_LOW_RATIO = 0.40;   // 나머지 3개 중앙값 대비 (걸린 바퀴)
-const float WHEEL_HIGH_RATIO = 2.00;  // (들려서 헛도는 바퀴)
+const float WHEEL_LOW_RATIO = 0.40;   // 실측 최소 비율 0.84 대비 2.1배 여유 (걸린 바퀴)
+const float WHEEL_HIGH_RATIO = 2.00;  // 실측 최대 비율 1.13 대비 1.8배 여유 (들려서 헛도는 바퀴)
 const uint8_t WHEEL_TICKS = 5;
 
 // 출발 직후엔 엔코더가 0에서 시작하고 currentBasePWM 도 40부터 램프업하므로
