@@ -102,6 +102,11 @@ class PathRecommender:
     SLIP_MAX_SCAN_DELTA_M = 0.05  # 라이다가 본 세상이 이만큼도 안 변했으면 슬립
     SLIP_STRUCT_RATIO     = 0.30  # 0.2~4m 유효 포인트 비율. 미만이면 판정 보류
     SLIP_MIN_MATCHED      = 30    # 두 스캔 사이에 각도가 매칭된 최소 포인트 수
+    # [오검출 방지] 오도메트리 좌표가 물리적으로 불가능한 속도로 튀면 그건 "이동"이
+    # 아니라 데이터 불연속(PC 재시작으로 메가의 누적 좌표를 뒤늦게 받음, BLE 재연결,
+    # 패킷 오파싱)이다. 실측 주행 속도는 0.35~0.39m/s 이므로 1.0m/s 를 넘는 변화는
+    # 전부 불연속으로 간주하고 비교 창을 통째로 버린다.
+    SLIP_MAX_PLAUSIBLE_MPS = 1.0
 
     # ── 이상 상태 탈출 (REVERSE 명령) ────────────────────────────
     # 로봇 후방에는 센서가 하나도 없다 (라이다 FOV 180도, 초음파는 좌/우, OAK 는 전방).
@@ -223,6 +228,7 @@ class PathRecommender:
         self.fault_escape_x: float = 0.0      # 탈출 전진 시작 좌표
         self.fault_escape_y: float = 0.0
         self._scan_history: List[Tuple[float, dict, float, float, float]] = []
+        self._last_scan_ts: float = -1.0   # 같은 스캔을 두 번 넣지 않기 위한 신선도 검사용
 
         # BLE 수신 데이터 저장 (초기 시작 시 오인 정지/회피 방지를 위해 999.0cm로 초기화)
         self.ble_right_cm = 999.0
@@ -663,7 +669,32 @@ class PathRecommender:
         if scan is None or not getattr(scan, "points", None):
             return
 
+        # [가드 1 - 스캔 신선도] LidarProcessor.get_scan() 은 큐가 비면 직전 스캔을
+        # 그대로 다시 돌려준다. 라이다는 5~10Hz 인데 메인 루프는 15FPS 를 노리므로
+        # "같은 스캔"이 반복해서 들어오는 게 정상이다. 이걸 그냥 쌓으면 비교 대상이
+        # 자기 자신이 되어 scan_delta 가 항상 0 -> "세상이 안 변했다"가 무조건 참이
+        # 되고, 슬립 판정이 오도메트리 하나에만 의존하게 된다. 새 스캔만 받는다.
+        scan_ts = float(getattr(scan, "timestamp", 0.0) or 0.0)
+        if scan_ts > 0.0 and scan_ts == self._last_scan_ts:
+            return
+        self._last_scan_ts = scan_ts
+
         now = time.time()
+
+        # [가드 2 - 오도메트리 연속성] 좌표가 물리적으로 불가능한 속도로 튀었다면
+        # 실제 이동이 아니라 데이터 불연속이다. 비교 창이 그 점프를 가로지르면
+        # "오도메트리는 갔는데 세상은 그대로" 가 성립해 정지 중에도 슬립으로 오판한다.
+        # 점프를 관측하면 히스토리를 비워 창이 점프를 포함하지 못하게 한다.
+        if self._scan_history:
+            p_t, _, _, px, py = self._scan_history[-1]
+            dt = now - p_t
+            if dt > 0.0:
+                jump = math.hypot(self.robot_x - px, self.robot_y - py)
+                if jump / dt > self.SLIP_MAX_PLAUSIBLE_MPS:
+                    print(f"[PathRecommender] [SLIP GUARD] 오도메트리 불연속 감지 "
+                          f"({jump:.2f}m / {dt:.2f}s = {jump/dt:.1f}m/s) -> 슬립 비교 창 초기화")
+                    self._scan_history.clear()
+
         binned = {}
         close_pts = 0
         for p in scan.points:
@@ -745,7 +776,13 @@ class PathRecommender:
             return self.fault_code
 
         # 2) PC 자체 판정 (슬립) - 실제로 직진 주행 중일 때만
-        if self.state == "FORWARD" and self.avoid_state in ("IDLE", "AVOID_PASS_WIDTH", "AVOID_PASS_LENGTH"):
+        # [가드 3] 정지 명령을 보내고 있는 동안은 판정하지 않는다. 로봇이 서 있으면
+        # 라이다도 당연히 안 변하므로 "세상이 안 변했다" 조건이 무조건 참이 되고,
+        # 판정이 오도메트리 신뢰성 하나에만 걸리게 된다 - 그런데 오도메트리를 못
+        # 믿는 상황을 잡으려는 게 이 검사의 목적이라 자기모순이다.
+        commanding_drive = not str(getattr(self, "last_sent_payload", "")).startswith("STOP")
+        if (commanding_drive and self.state == "FORWARD"
+                and self.avoid_state in ("IDLE", "AVOID_PASS_WIDTH", "AVOID_PASS_LENGTH")):
             slip = self._check_slip()
             if slip is not None:
                 moved, delta, matched = slip
